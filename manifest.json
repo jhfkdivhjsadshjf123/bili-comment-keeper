@@ -1,0 +1,94 @@
+{
+  "manifest_version": 3,
+  "name": "B站评论管家",
+  "short_name": "评论管家",
+  "version": "1.14.1",
+  "description": "自动记录自己在 B 站发布的每条评论链接并存入书签栏，支持一键批量删除、把已删链接原样归档，并可导入 aicu.cc 的历史评论补删。",
+  "author": "bili-comment-keeper",
+  "homepage_url": "https://github.com/jhfkdivhjsadshjf123/bili-comment-keeper",
+  "minimum_chrome_version": "116",
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+
+  "permissions": [
+    "bookmarks",
+    "storage",
+    "scripting",
+    "sidePanel"
+  ],
+
+  "host_permissions": [
+    "https://*.bilibili.com/*",
+    "https://*.aicu.cc/*"
+  ],
+
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "B站评论管家",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "options_page": "options/options.html",
+
+  "side_panel": {
+    "default_path": "clean/clean.html"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["https://*.bilibili.com/*"],
+      "js": ["src/content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://*.bilibili.com/*"],
+      "js": ["src/recorder-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://message.bilibili.com/*"],
+      "js": ["src/my-comments-panel.js"],
+      "css": ["src/inject-messages.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://*.aicu.cc/*", "https://aicu.cc/*"],
+      "js": ["src/content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://*.aicu.cc/*", "https://aicu.cc/*"],
+      "js": ["src/aicu-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://*.aicu.cc/*", "https://aicu.cc/*"],
+      "js": ["src/aicu-auto.js"],
+      "run_at": "document_idle",
+      "world": "MAIN",
+      "all_frames": false
+    }
+  ]
+}

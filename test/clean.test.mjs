@@ -1,0 +1,1220 @@
+/**
+ * clean.test.mjs —— 删除链路（控制台侧）的回归测试
+ *
+ * 为什么专门给这块写测试：删除依赖一条**跨三个世界**的链路
+ *   注入 bilibili 页面(MAIN) → 页面回传 → 内容脚本(ISOLATED) → 控制台
+ * 这条链上任何一环断了，外在表现都是「点了删除之后一片安静」，然后每条各等满超时。
+ * 这个坑已经真实发生过两次，而且**单元测试、语法检查、打包验证全抓不到**。
+ *
+ * clean.js 是个 ES module 而且一加载就碰 DOM，没法直接 import。
+ * 所以这里把它当**经典脚本**丢进 vm：去掉 import（改成把 src/ 的导出铺在全局上）、
+ * 去掉末尾的 init()，于是里面的顶层 function 声明都变成可以直接调的全局函数。
+ * 测的是真代码，不是复制品。
+ *
+ * 纯 Node，零依赖：node test/clean.test.mjs
+ */
+
+import assert from 'node:assert/strict';
+import { loadSrc } from './load-src.mjs';
+import { readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
+
+let passed = 0, failed = 0;
+
+async function test(name, fn) {
+  try {
+    await fn();
+    console.log(`  \u2713 ${name}`);
+    passed++;
+  } catch (e) {
+    console.error(`  \u2717 ${name}`);
+    console.error(`      ${(e && e.message) || e}`);
+    failed++;
+  }
+}
+
+/* ------------------------------------------- 把 clean/ 下的模块装进 vm
+ *
+ * 面板代码是若干原生 ES 模块（零构建）。测试没法直接 import 它们 ——
+ * 它们一加载就要 DOM 和 chrome.*。所以这里模拟浏览器的模块图，但换个做法：
+ * 按依赖顺序把每个模块**拼成一个脚本**，再丢进 vm。
+ *
+ * 拼接规则（就两条，够用）：
+ *   · 剥掉 `import ... from '...'` —— 被导入的东西在拼接后本来就是同一个作用域
+ *   · 剥掉行首的 `export ` —— 同上
+ *
+ * 顺序要求：被依赖的模块排在前面（state 最前，main 最后）。
+ */
+
+const CLEAN_DIR = fileURLToPath(new URL('../clean/', import.meta.url));
+
+/** 拼接顺序 = 依赖顺序。新增模块记得加进来。 */
+export const MODULE_ORDER = [
+  'state.js',
+  'dom.js',
+  'probe-plan.js',
+  'library.js',
+  'import.js',
+  'backup.js',
+  'probe.js',
+  'delete.js',
+  'data.js',
+  'main.js'
+];
+
+function readModules() {
+  const parts = [];
+  for (const name of MODULE_ORDER) {
+    const p = join(CLEAN_DIR, name);
+    if (!existsSync(p)) continue;
+    parts.push({ name, src: readFileSync(p, 'utf8') });
+  }
+  return parts;
+}
+
+const MODULES = readModules();
+assert.ok(MODULES.length > 0, 'clean/ 下至少得有一个模块');
+
+const SRC = MODULES.map(function (m) {
+  return m.src
+    // 剥 import（含多行的那种）
+    .replace(/^import\s*\{[\s\S]*?\}\s*from\s*'[^']*';\s*$/gm, '')
+    .replace(/^import\s+[^;]+;\s*$/gm, '')
+    // 剥行首的 export
+    .replace(/^export\s+/gm, '')
+    // 末尾那句 init() 会在加载时碰 DOM，去掉
+    .replace(/^init\(\)\.catch\(.*$/gm, '');
+}).join('\n');
+
+assert.ok(!/^\s*import\s/m.test(SRC), 'import 应该已经被剥掉');
+assert.ok(!/^\s*export\s/m.test(SRC), 'export 应该已经被剥掉');
+assert.ok(!/^init\(\)/m.test(SRC), '末尾的 init() 应该已经被剥掉');
+assert.ok(!/^export /m.test(SRC));
+
+/** 一个够用的假 DOM 元素。classList 是真的能用 —— 视图切换就靠它。 */
+function fakeEl() {
+  const classes = new Set();
+  return {
+    textContent: '', className: '', innerHTML: '', disabled: false, checked: true,
+    indeterminate: false,
+    open: false, style: {}, dataset: {},
+    classList: {
+      add(c) { classes.add(c); },
+      remove(c) { classes.delete(c); },
+      contains(c) { return classes.has(c); },
+      toggle(c, on) {
+        const want = on === undefined ? !classes.has(c) : !!on;
+        if (want) classes.add(c); else classes.delete(c);
+        return want;
+      },
+      _set() { return classes; }
+    },
+    addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; },
+    closest() { return null; }
+  };
+}
+
+const els = new Map();
+const fakeDoc = {
+  cookie: 'bili_jct=deadbeef; SESSDATA=abc',
+  getElementById(id) { if (!els.has(id)) els.set(id, fakeEl()); return els.get(id); },
+  querySelector() { return null; },
+  querySelectorAll() { return []; }
+};
+
+/**
+ * 建一个沙箱；injectHook 决定「注入删除脚本」这一步的行为。
+ * opts.seed 可以预置 chrome.storage.local 的内容（用来铺一份评论库）。
+ */
+async function makeSandbox(injectHook, opts) {
+  const shared = await loadSrc();   // src/ 拆成多模块了，集中在这里合并
+  const pageStore = {};          // 模拟页面上的 window.__bcDelResults
+  const posts = [];              // 模拟页面发出的 postMessage
+  const worlds = [];             // 记录每次注入用的世界（MAIN / ISOLATED）
+
+  const changeListeners = [];
+  const localData = new Map();
+  const seed = (opts && opts.seed) || {};
+  for (const k of Object.keys(seed)) localData.set(k, seed[k]);
+
+  // 每个沙箱用自己的元素表，免得用例之间互相串
+  const ownEls = new Map();
+  const doc = Object.assign({}, fakeDoc, {
+    getElementById(id) { if (!ownEls.has(id)) ownEls.set(id, fakeEl()); return ownEls.get(id); }
+  });
+
+  const chromeStub = {
+    runtime: {
+      onMessage: { addListener() {} },
+      sendMessage: async () => ({}),
+      getManifest: () => ({ version: '1.2.0' }),
+      openOptionsPage() {}
+    },
+    storage: {
+      local: {
+        async get(keys) {
+          const out = {};
+          const list = Array.isArray(keys) ? keys : (typeof keys === 'string' ? [keys] : Object.keys(keys || {}));
+          for (const k of list) if (localData.has(k)) out[k] = localData.get(k);
+          return out;
+        },
+        async set(obj) { for (const k of Object.keys(obj)) localData.set(k, obj[k]); },
+        async remove(keys) {
+          for (const k of (Array.isArray(keys) ? keys : [keys])) localData.delete(k);
+        }
+      },
+      // 面板靠它感知"库变了"（发评论后要立刻刷新，不能等用户关掉重开）
+      onChanged: {
+        addListener(fn) { changeListeners.push(fn); }
+      }
+    },
+    bookmarks: {
+      getChildren: async () => [], get: async () => null, search: async () => [],
+      create: async () => ({ id: 'x' }), move: async () => {}, remove: async () => {}, removeTree: async () => {}
+    },
+    tabs: {
+      query: async () => [], get: async () => ({ id: 1, status: 'complete' }),
+      create: async () => ({ id: 1 }), remove: async () => {}, sendMessage: async () => {},
+      onUpdated: { addListener() {}, removeListener() {} }
+    },
+    scripting: {
+      async executeScript({ args, world }) {
+        const a = args || [];
+        worlds.push(world || 'MAIN');
+        // 轮询读取：args[0] 是字符串（requestId）
+        if (typeof a[0] === 'string') {
+          return [{ result: pageStore[a[0]] || null }];
+        }
+        // 注入删除脚本 / 自检探针（自检那次不带 args）
+        return await injectHook(a[0], pageStore);
+      }
+    }
+  };
+
+  // src/ 里那些函数是 **Node 里的真实模块**，它们读的是 Node 全局的 chrome，
+  // 不是 vm 沙箱里的那个。所以得把桩同时挂到全局上，否则会报 "chrome is not defined"。
+  // 用例是顺序 await 的，每个 makeSandbox 覆盖一次不会互相干扰。
+  globalThis.chrome = chromeStub;
+
+  const sandbox = Object.assign({}, shared, {
+    chrome: chromeStub,
+    document: doc,
+    console, setTimeout, clearTimeout, clearInterval,
+    URL, URLSearchParams, AbortController, Promise,
+    JSON, Math, Date, Number, String, Array, Object, RegExp, isFinite, Error
+  });
+
+  // fetch 装成 getter/setter：任何测试塞进来的假响应都自动补上 text()。
+  // 生产代码要拿 text() 才能分辨「返回的到底是数据、还是被反爬拦成的 HTML」，
+  // 但让每个测试桩都手写一遍 text() 太啰嗦，这里统一补上。
+  let fetchImpl = async () => ({ status: 200, json: async () => ({ code: 0, message: '' }) });
+  Object.defineProperty(sandbox, 'fetch', {
+    configurable: true,
+    get() {
+      return async function (...args) {
+        const res = await fetchImpl(...args);
+        if (res && typeof res === 'object') {
+          if (typeof res.text !== 'function' && typeof res.json === 'function') {
+            res.text = async () => JSON.stringify(await res.json());
+          }
+          if (res.status === undefined) res.status = 200;
+        }
+        return res;
+      };
+    },
+    set(fn) { fetchImpl = fn; }
+  });
+  sandbox.window = sandbox;
+  sandbox.window.postMessage = m => posts.push(m);
+
+  vm.createContext(sandbox);
+  // 拼接后的脚本跑在 vm 里，`const state` 这类**模块绑定不会变成全局属性** ——
+  // 浏览器里也一样（模块绑定不是 window 上的东西）。所以这里显式接一根线出来，
+  // 让用例能摆布状态（比如伪造"正在巡检"）。
+  vm.runInContext(SRC + '\n;globalThis.state = state;\n', sandbox, { filename: 'clean.js' });
+
+  const fireStorageChange = (changes, area) => {
+    for (const fn of changeListeners) fn(changes, area || 'local');
+  };
+
+  return { sandbox, pageStore, posts, worlds, localData, els: ownEls, fireStorageChange };
+}
+
+console.log('\n删除链路（clean.js）回归测试\n');
+console.log('— 注入脚本的回传契约 —');
+
+await test('mainWorldDelete 把结果挂到 window.__bcDelResults 上，同时发出 postMessage', async () => {
+  const { sandbox, posts } = await makeSandbox(async () => [{ result: undefined }]);
+
+  const out = await sandbox.mainWorldDelete({ requestId: 'r1', type: 1, oid: '555', rpid: '999' });
+
+  assert.equal(out.requestId, 'r1');
+  assert.equal(out.ok, true, '接口返回 code 0，应当算成功');
+
+  // 通道 ①：控制台靠这个来取结果
+  const stored = sandbox.window.__bcDelResults && sandbox.window.__bcDelResults.r1;
+  assert.ok(stored, '必须写进 window.__bcDelResults —— 这是主通道的数据来源');
+  assert.deepEqual(JSON.parse(JSON.stringify(stored)),
+    { ok: true, code: 0, message: '', requestId: 'r1' });
+
+  // 通道 ②：兜底的老路子
+  assert.ok(posts.some(m => m && m.__bcDeleterResult && m.__bcDeleterResult.requestId === 'r1'),
+    '也应该发出 __bcDeleterResult');
+});
+
+await test('页面读不到 bili_jct 时，回传的是可读的失败原因', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const saved = sandbox.document.cookie;
+  sandbox.document.cookie = 'SESSDATA=abc';
+
+  const out = await sandbox.mainWorldDelete({ requestId: 'r2', type: 1, oid: '5', rpid: '9' });
+  assert.equal(out.ok, false);
+  assert.match(out.message, /bili_jct/);
+
+  sandbox.document.cookie = saved;
+});
+
+await test('接口报错时把 code 原样带回（交给 explainCode 翻译）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({ json: async () => ({ code: -509, message: '请求过于频繁' }) });
+
+  const out = await sandbox.mainWorldDelete({ requestId: 'r3', type: 1, oid: '5', rpid: '9' });
+  assert.equal(out.ok, false);
+  assert.equal(out.code, -509);
+  assert.equal(sandbox.window.__bcDelResults.r3.code, -509);
+});
+
+console.log('\n— deleteOne 的两条回传通道 —');
+
+await test('主通道：控制台自己轮询页面上的结果（不依赖内容脚本）', async () => {
+  // 注入后 550ms 才把结果写到页面上；期间内容脚本那条通道完全不参与
+  const { sandbox, pageStore } = await makeSandbox(async (arg, store) => {
+    setTimeout(() => {
+      store[arg.requestId] = { requestId: arg.requestId, ok: true, code: 0, message: '' };
+    }, 550);
+    return [{ result: undefined }];
+  });
+
+  const r = await sandbox.deleteOne(1, { type: 1, oid: '5', rpid: '9' });
+  assert.equal(r.ok, true, '应当拿到成功结果');
+  assert.equal(r.code, 0);
+});
+
+await test('主通道带回失败码时原样透出', async () => {
+  const { sandbox } = await makeSandbox(async (arg, store) => {
+    setTimeout(() => {
+      store[arg.requestId] = { requestId: arg.requestId, ok: false, code: 12022, message: '该评论已经被删除了' };
+    }, 550);
+    return [{ result: undefined }];
+  });
+
+  const r = await sandbox.deleteOne(1, { type: 1, oid: '5', rpid: '9' });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 12022, '早就删过的标记必须原样带回，面板靠它记账');
+});
+
+await test('注入抛错（标签页被关了）会标记 tabGone，交给上层换标签页重试', async () => {
+  const { sandbox } = await makeSandbox(async () => { throw new Error('No tab with id: 1'); });
+
+  const r = await sandbox.deleteOne(1, { type: 1, oid: '5', rpid: '9' });
+  assert.equal(r.tabGone, true);
+  assert.match(r.message, /注入网页失败/);
+});
+
+await test('页面一直不回话时，给出可读的超时原因而不是永远卡住', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.BC_DELETE_TIMEOUT_MS = 2500;   // 生产是 23 秒，测试里调小
+
+  const t0 = Date.now();
+  const r = await sandbox.deleteOne(1, { type: 1, oid: '5', rpid: '9' });
+  const took = Date.now() - t0;
+
+  assert.equal(r.ok, false);
+  assert.match(r.message, /等待页面响应超时/, `实际：${r.message}`);
+  assert.ok(took < 8000, `不该拖太久，实际 ${took}ms`);
+});
+
+console.log('\n— 开工前自检 —');
+
+await test('自检：注入正常 + 有登录态 → 放行', async () => {
+  const { sandbox } = await makeSandbox(async () => [
+    { result: { hasJct: true, href: 'https://www.bilibili.com/', ready: 'complete' } }
+  ]);
+  sandbox.BC_PREFLIGHT_MS = 300;   // 测试里不用真等 6 秒
+
+  const r = await sandbox.preflight(1);
+  assert.equal(r.ok, true);
+});
+
+await test('自检：注入失败 → 拦下并说明原因', async () => {
+  const { sandbox } = await makeSandbox(async () => { throw new Error('Cannot access contents of the page'); });
+  const r = await sandbox.preflight(1);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /注入脚本失败/);
+});
+
+await test('自检：页面里读不到 bili_jct → 拦下并让人去登录', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: { hasJct: false, href: 'https://www.bilibili.com/' } }]);
+  const r = await sandbox.preflight(1);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /bili_jct/);
+});
+
+console.log('\n— 删除目标的解析 —');
+
+await test('aicu 导入的条目直接用自带的 type/oid，不去查索引', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+
+  const r = await sandbox.resolveTarget({
+    source: 'aicu', type: 1, oid: '555',
+    parsed: { rpid: '999', bvid: '', pageUrl: 'https://www.bilibili.com/video/av555' }
+  });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(r)), { type: 1, oid: '555', rpid: '999' });
+});
+
+await test('aicu 条目的 type 是字符串时也能用', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const r = await sandbox.resolveTarget({
+    source: 'aicu', type: '17', oid: 888, parsed: { rpid: '1', bvid: '', pageUrl: '' }
+  });
+  assert.equal(r.type, 17);
+  assert.equal(r.oid, '888');
+});
+
+console.log('\n— 存活判定（纯逻辑，拿真实样本对照） —');
+
+await test('判定：12006「没有该评论」→ 已删（样本1就是这个）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const r = sandbox.interpretReplyCheck({ code: 12006, message: '没有该评论' });
+  assert.equal(r.alive, false);
+  assert.equal(r.code, 12006);
+});
+
+await test('判定：一级评论还在 → 活着，且 rootRpid 就是它自己', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const r = sandbox.interpretReplyCheck({ code: 0, data: { root: { rpid: 200000000000001 } } });
+  assert.equal(r.alive, true);
+  assert.equal(r.rootRpid, '200000000000001');
+});
+
+await test('判定：会话还在但根评论没了 → 已删', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  assert.equal(sandbox.interpretReplyCheck({ code: 0, data: {} }).alive, false);
+});
+
+await test('判定：风控等其它 code 一律「不确定」，绝不误判成已删', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  assert.equal(sandbox.interpretReplyCheck({ code: -509, message: '请求过于频繁' }).alive, null);
+  assert.equal(sandbox.interpretReplyCheck(null).alive, null);
+  assert.equal(sandbox.interpretReplyCheck({ message: '没有 code' }).alive, null);
+});
+
+await test('判定：楼中楼 —— rootRpid 不等于被查的那条，就得再去会话里确认', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  // 样本2：查的是二级评论，B 站把 root 给成了会话的根 200000000000002
+  const r = sandbox.interpretReplyCheck({ code: 0, data: { root: { rpid: 200000000000002 } } });
+  assert.equal(r.alive, true, 'code 0 只说明这条会话还在');
+  assert.equal(r.rootRpid, '200000000000002');
+});
+
+await test('buildReplyUrl：参数齐全', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const u = sandbox.buildReplyUrl({ type: 1, oid: '100000000000001', root: '200000000000001', pn: 1, ps: 1 });
+  assert.match(u, /\/x\/v2\/reply\/reply/);
+  assert.match(u, /type=1/);
+  assert.match(u, /oid=100000000000001/);
+  assert.match(u, /root=200000000000001/);
+  assert.ok(!/reply\/del/.test(u), '探测绝不能碰删除接口');
+});
+
+console.log('\n— 取数据：两条路自动选 —');
+
+await test('扩展直发：通了就直接用，压根不去动标签页', async () => {
+  const { sandbox, worlds } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.state.probeDirectWorks = null;
+  sandbox.fetch = async () => ({ status: 200, text: async () => JSON.stringify({ code: 12006 }) });
+
+  const r = await sandbox.fetchReplyRaw({ type: 1, oid: '5', root: '9', pn: 1, ps: 1 });
+  assert.equal(r.json.code, 12006);
+  assert.equal(sandbox.state.probeDirectWorks, true);
+  assert.equal(worlds.length, 0, '直发通了就不该去借 bilibili 标签页');
+});
+
+await test('扩展直发被拦成 HTML → 自动退回借标签页，并记住以后别再试直发', async () => {
+  const { sandbox, worlds } = await makeSandbox(async (arg, store) => {
+    setTimeout(() => {
+      store[arg.requestId] = {
+        requestId: arg.requestId, ok: true, status: 200, text: JSON.stringify({ code: 12006 })
+      };
+    }, 550);
+    return [{ result: undefined }];
+  });
+  sandbox.state.probeDirectWorks = null;
+  sandbox.fetch = async () => ({ status: 412, text: async () => '<!DOCTYPE html><html>风险</html>' });
+
+  const first = await sandbox.fetchReplyRaw({ type: 1, oid: '5', root: '9', pn: 1, ps: 1 });
+  assert.equal(first.json.code, 12006, '退回标签页之后应该拿到数据');
+  assert.equal(sandbox.state.probeDirectWorks, false);
+
+  const before = worlds.length;
+  const second = await sandbox.fetchReplyRaw({ type: 1, oid: '5', root: '9', pn: 1, ps: 1 });
+  assert.equal(second.json.code, 12006);
+  assert.equal(sandbox.state.probeDirectWorks, false, '记住哪条路通，不必每条都重新试错');
+  assert.ok(worlds.length > before, '第二次应该直接走标签页那条路');
+});
+
+console.log('\n— checkAliveOne：完整判定 —');
+
+await test('一级评论还在 → 活着', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({
+    status: 200, text: async () => JSON.stringify({ code: 0, data: { root: { rpid: 999 } } })
+  });
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
+  assert.equal(r.alive, true);
+});
+
+await test('一级评论没了 → 已删', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({ status: 200, text: async () => JSON.stringify({ code: 12006 }) });
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
+  assert.equal(r.alive, false);
+});
+
+await test('楼中楼：会话里能找到本人 → 活着', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const seen = [];
+  sandbox.fetch = async (url) => {
+    seen.push(url);
+    if (/root=222/.test(url)) {
+      return { status: 200, text: async () => JSON.stringify({ code: 0, data: { root: { rpid: 111 } } }) };
+    }
+    return {
+      status: 200,
+      text: async () => JSON.stringify({ code: 0, data: { replies: [{ rpid: 222 }, { rpid: 333 }], page: { count: 2 } } })
+    };
+  };
+
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '222' });
+  assert.equal(r.alive, true);
+  assert.ok(seen.length >= 2, '楼中楼必须多问一次会话，光看 code 会误判');
+  assert.ok(seen.some(u => /root=111/.test(u)), '要拿解析出来的根评论去查会话');
+});
+
+await test('楼中楼：会话还在但本人不在里面 → 已删（样本2的真实情形）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async (url) => {
+    if (/root=999/.test(url)) {
+      // B 站把这个二级评论解析到了会话的根
+      return { status: 200, text: async () => JSON.stringify({ code: 0, data: { root: { rpid: 200000000000002 } } }) };
+    }
+    return {
+      status: 200,
+      text: async () => JSON.stringify({ code: 0, data: { replies: [{ rpid: 1 }, { rpid: 2 }], page: { count: 2 } } })
+    };
+  };
+
+  const r = await sandbox.checkAliveOne({ type: 11, oid: '300000001', rpid: '999' });
+  assert.equal(r.alive, false, '翻完会话都没有本人 → 判定为已删');
+});
+
+/** 造一条按时间升序的长会话，供楼中楼定位测试用 */
+function makeThread(opts) {
+  const TOTAL = opts.total;
+  const PAGE = 20;
+  const T0 = 1700000000;
+  const targetRpid = opts.targetRpid;
+  const targetIndex = opts.targetIndex;      // 从 0 开始
+  const seen = [];
+
+  const fetch = async (url) => {
+    // 第一次查本人：B 站把二级评论解析到会话根
+    if (/ps=1(&|$)/.test(url)) {
+      return {
+        status: 200,
+        text: async () => JSON.stringify({ code: 0, data: { root: { rpid: opts.rootId } } })
+      };
+    }
+    const pn = Number((/pn=(\d+)/.exec(url) || [])[1] || 1);
+    const ps = Number((/ps=(\d+)/.exec(url) || [])[1] || 0);
+    seen.push({ pn: pn, ps: ps });
+
+    const list = [];
+    for (let k = 0; k < PAGE; k++) {
+      const idx = (pn - 1) * PAGE + k;
+      if (idx >= TOTAL) break;
+      list.push({
+        rpid: idx === targetIndex ? targetRpid : String(1000000 + idx),
+        ctime: T0 + idx
+      });
+    }
+    return {
+      status: 200,
+      text: async () => JSON.stringify({ code: 0, data: { replies: list, page: { count: TOTAL } } })
+    };
+  };
+
+  return { fetch, seen, ctimeOf: i => T0 + i };
+}
+
+await test('楼中楼：在很长的会话里也能找到本人（用户反馈的就是这种）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+
+  // 200 条、每页 20 → 共 10 页；本人排在第 131 条（第 7 页）。
+  // 老逻辑写 ps=49 却只拿到 20 条，翻 3 页就"以为翻完了"，于是判成未检查。
+  const th = makeThread({ total: 200, targetIndex: 130, targetRpid: '999', rootId: '111' });
+  sandbox.fetch = th.fetch;
+
+  const r = await sandbox.checkAliveOne({
+    type: 1, oid: '5', rpid: '999', ctime: th.ctimeOf(130)
+  });
+
+  assert.equal(r.state, 'live', `应该找到本人，实际 state=${r.state}／note=${r.message}`);
+  assert.ok(th.seen.length <= 8,
+    `按时间二分定位不该翻很多页，实际翻了 ${th.seen.length} 页：` +
+    th.seen.map(x => x.pn).join(','));
+});
+
+await test('楼中楼：请求必须用 ps=20 —— B 站把每页硬限制在 20，写 49 只是自欺欺人', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const th = makeThread({ total: 60, targetIndex: 25, targetRpid: '999', rootId: '111' });
+  sandbox.fetch = th.fetch;
+
+  await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999', ctime: th.ctimeOf(25) });
+
+  assert.ok(th.seen.length > 0);
+  for (const s of th.seen) {
+    assert.equal(s.ps, 20, `翻会话必须用 ps=20，实际 ps=${s.ps}`);
+  }
+});
+
+await test('楼中楼：时间定位到了却不在那一带 → 判定为已删', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  // 会话 200 条，但"本人"根本不在里面
+  const th = makeThread({ total: 200, targetIndex: -1, targetRpid: '999', rootId: '111' });
+  sandbox.fetch = th.fetch;
+
+  const r = await sandbox.checkAliveOne({
+    type: 1, oid: '5', rpid: '999', ctime: th.ctimeOf(130)
+  });
+
+  assert.equal(r.state, 'gone', `实际 state=${r.state}／note=${r.message}`);
+  assert.match(r.message, /没有它|已经没有/);
+});
+
+await test('楼中楼：没有时间戳就不下结论，并且说清为什么', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const th = makeThread({ total: 200, targetIndex: 130, targetRpid: '999', rootId: '111' });
+  sandbox.fetch = th.fetch;
+
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });   // 没有 ctime
+  assert.equal(r.state, 'unknown', '定位不了就别乱判');
+  assert.match(r.message, /时间/);
+});
+
+await test('查不到：视频不可访问（-404）单独归为 unreachable，不能混进"未检查"', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({
+    status: 200, text: async () => JSON.stringify({ code: -404, message: '啥都木有' })
+  });
+
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
+  assert.equal(r.state, 'unreachable');
+  assert.match(r.message, /访问不到/, `原因要说清，实际：${r.message}`);
+});
+
+await test('探测拿不准时的原因会原样带出来（便于排查）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({ status: 412, text: async () => '<!DOCTYPE html><html>风险</html>' });
+  sandbox.window.__bcNativeFetch = sandbox.fetch;
+
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
+  assert.equal(r.alive, null);
+  assert.ok(r.message && r.message.length > 0, '必须给得出原因');
+});
+
+console.log('\n— 注入的搬运函数 —');
+
+const REPLY_URL = 'https://api.bilibili.com/x/v2/reply/reply?type=1&oid=5&root=9&pn=1&ps=1';
+
+await test('mainWorldFetchReply：用原生 fetch、不带凭据、只把原文带回来', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const calls = [];
+  sandbox.window.__bcNativeFetch = async (url, init) => {
+    calls.push({ url, init });
+    return { status: 200, text: async () => '{"code":12006}' };
+  };
+  sandbox.fetch = async () => { throw new Error('不该用被包过的 fetch'); };
+
+  const out = await sandbox.mainWorldFetchReply({ requestId: 'x', url: REPLY_URL });
+  assert.equal(out.ok, true);
+  assert.equal(out.text, '{"code":12006}', '只搬运原文，判断交给控制台');
+  assert.equal(calls[0].init.credentials, 'omit', '探测不带任何凭据');
+  assert.equal(calls[0].url, REPLY_URL, '地址原样透传，不在注入脚本里拼');
+  assert.ok(sandbox.window.__bcDelResults.x, '结果要写进结果槽，供控制台取回');
+});
+
+await test('mainWorldFetchReply：没给地址就直接报错，不发请求', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  let called = 0;
+  sandbox.window.__bcNativeFetch = async () => { called++; return { status: 200, text: async () => '{}' }; };
+
+  const out = await sandbox.mainWorldFetchReply({ requestId: 'z' });
+  assert.equal(out.ok, false);
+  assert.equal(called, 0);
+});
+
+await test('mainWorldFetchReply：页面里没有原生 fetch 时退回页面的 fetch', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const seen = [];
+  delete sandbox.window.__bcNativeFetch;
+  sandbox.fetch = async () => { seen.push(1); return { status: 200, text: async () => '{"code":0}' }; };
+
+  await sandbox.mainWorldFetchReply({ requestId: 'y', url: REPLY_URL });
+  assert.equal(seen.length, 1);
+});
+
+console.log('\n— 库视图渲染 —');
+
+await test('库列表：评论正文必须转义（内容来自互联网）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+
+  const html = sandbox.libRowHtml({
+    rpid: '999', type: 1, oid: '555', root: '0', rank: 1,
+    message: '<img src=x onerror=alert(1)>正常文字',
+    ctime: 1700000000, state: 'live'
+  });
+
+  assert.ok(html.indexOf('<img') < 0, '标签本身绝不能被渲染出来');
+  assert.ok(html.indexOf('&lt;img') >= 0, '应该转义成实体');
+  assert.ok(html.indexOf('正常文字') >= 0, '正常文字要保留');
+});
+
+await test('库列表：有视频标题就显示标题，没有就退回 av 号', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const base = { rpid: '1', type: 1, oid: '555', root: '0', rank: 1, message: 'x', ctime: 1700000000, state: 'live' };
+
+  const withTitle = sandbox.libRowHtml(Object.assign({}, base, {
+    video: { title: '某个视频标题', owner: '某UP' }
+  }));
+  assert.ok(withTitle.indexOf('某个视频标题') >= 0, '有标题就该显示标题 —— 不然一列 av 号没法看');
+  assert.ok(withTitle.indexOf('某UP') >= 0);
+
+  const noTitle = sandbox.libRowHtml(base);
+  assert.ok(noTitle.indexOf('av555') >= 0, '没标题时退回 av 号');
+});
+
+await test('库列表：状态标签和两个链接都在', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const base = { rpid: '200000000000001', type: 1, oid: '100000000000001', root: '0', rank: 1, message: 'x', ctime: 1700000000 };
+
+  assert.match(sandbox.libRowHtml(Object.assign({}, base, { state: 'live' })), /tag live[^>]*>还在/);
+  assert.match(sandbox.libRowHtml(Object.assign({}, base, { state: 'gone' })), /tag gone[^>]*>已没了/);
+  assert.match(sandbox.libRowHtml(Object.assign({}, base, { state: 'deleted' })), /tag deleted[^>]*>已删除/);
+  assert.match(sandbox.libRowHtml(Object.assign({}, base, { state: 'unknown' })), /未检查/);
+
+  const html = sandbox.libRowHtml(Object.assign({}, base, { state: 'live' }));
+  assert.match(html, /方式0/);
+  assert.match(html, /方式2/);
+  assert.match(html, /data-rpid="200000000000001"/);
+});
+
+await test('库列表：没有正文时给个占位，不要空着', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const html = sandbox.libRowHtml({
+    rpid: '1', type: 1, oid: '5', root: '0', rank: 1, message: '', ctime: 0, state: 'unknown'
+  });
+  assert.ok(html.indexOf('（没有正文）') >= 0);
+  assert.ok(html.indexOf('时间未知') >= 0);
+});
+
+await test('分页：只有一页时不显示翻页器，多页时给页码', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+
+  sandbox.libPage = 0;
+  assert.equal(sandbox.libPagerHtml(10), '', '只有一页就不该有翻页器');
+
+  const p = sandbox.libPagerHtml(500);
+  assert.match(p, /data-page="prev"/);
+  assert.match(p, /data-page="next"/);
+  assert.match(p, /第 1 \/ 10 页/);
+});
+
+await test('状态筛选栏：计数和选中态', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.libStates = [];
+
+  const el = sandbox.document.getElementById('lib-states');
+  sandbox.renderLibFilters({ total: 100, live: 17, gone: 81, deleted: 2, unknown: 0 });
+
+  assert.match(el.innerHTML, /data-state="all"/);
+  assert.match(el.innerHTML, /还在 <b>17<\/b>/);
+  assert.match(el.innerHTML, /已没了 <b>81<\/b>/);
+  assert.equal((el.innerHTML.match(/chip on/g) || []).length, 1, '「全部」应该处于选中态');
+});
+
+console.log('\n— 删除队列的准入规则 —');
+
+/** 铺一份评论库到假 storage 里 */
+function seedLibrary(items) {
+  const map = {};
+  for (const it of items) map[it.rpid] = it;
+  return { bc_library: { v: 2, uid: 'u', total: items.length, items: map, videos: {} } };
+}
+
+const libItem = (rpid, state, extra) => Object.assign({
+  rpid: rpid, type: 1, oid: '555', root: '0', rank: 1,
+  message: '评论 ' + rpid, ctime: 1700000000, state: state
+}, extra || {});
+
+await test('「删除选中」不会把"已经没了"的放进队列（用户反馈的线上 bug）', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([
+      libItem('1', 'live'),
+      libItem('2', 'gone'),
+      libItem('3', 'deleted'),
+      libItem('4', 'unknown')
+    ])
+  });
+
+  for (const r of ['1', '2', '3', '4']) sandbox.state.libSelected.add(r);
+  await sandbox.deleteSelected();
+
+  const queue = els.get('queue-list').innerHTML;
+  assert.ok(queue.indexOf('data-id="aicu:1"') >= 0, '还在的应该进队列');
+  assert.ok(queue.indexOf('data-id="aicu:4"') >= 0, '没查过的也该进 —— 删一次正好当探测');
+  assert.ok(queue.indexOf('data-id="aicu:2"') < 0, '已经没了的绝不能进队列');
+  assert.ok(queue.indexOf('data-id="aicu:3"') < 0, '之前删过的也不能进队列');
+
+  const hint = els.get('hint').textContent;
+  assert.match(hint, /去掉|跳过/, `要说清哪些被去掉了，实际提示：${hint}`);
+});
+
+await test('「删除选中」全选成"没了的"时不建队列，而是说清原因', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([libItem('2', 'gone'), libItem('3', 'gone')])
+  });
+
+  sandbox.state.libSelected.add('2');
+  sandbox.state.libSelected.add('3');
+  await sandbox.deleteSelected();
+
+  const queueEl = els.get('queue-list');
+  assert.equal((queueEl && queueEl.innerHTML) || '', '',
+    '队列里不该有任何东西 —— 全被挡下时连队列都不该重建');
+
+  const hint = els.get('hint').textContent;
+  assert.match(hint, /不能进删除队列/);
+  assert.match(hint, /2 条已经没了/, `要报出具体条数，实际：${hint}`);
+  assert.equal(sandbox.state.libSelected.size, 0, '被挡下的要从勾选里摘掉，免得反复撞');
+});
+
+await test('「把库里的全部加入队列」也挡住 gone 和 deleted', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([
+      libItem('1', 'live'),
+      libItem('2', 'gone'),
+      libItem('3', 'deleted'),
+      libItem('4', 'unknown')
+    ])
+  });
+
+  await sandbox.mergeAicu();
+
+  const queue = els.get('queue-list').innerHTML;
+  assert.ok(queue.indexOf('data-id="aicu:1"') >= 0);
+  assert.ok(queue.indexOf('data-id="aicu:4"') >= 0);
+  assert.ok(queue.indexOf('data-id="aicu:2"') < 0, '已经没了的不能进');
+  assert.ok(queue.indexOf('data-id="aicu:3"') < 0,
+    'deleted 尤其不能漏 —— 老的 alive 字段对它算 undefined，只查 alive 会漏网');
+
+  const hint = els.get('aicu-hint').textContent;
+  assert.match(hint, /1 条探测过、确认已经没了/);
+  assert.match(hint, /1 条是之前删过的/);
+});
+
+console.log('\n— 主视图 / 副视图（导入历史是初始化步骤，不是日常功能） —');
+
+await test('默认在库视图：导入视图是藏着的', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }]);
+
+  sandbox.showView('main');
+  assert.equal(els.get('view-main').classList.contains('hide'), false, '库视图要显示');
+  assert.equal(els.get('view-import').classList.contains('hide'), true, '导入视图要藏着');
+});
+
+await test('点进导入视图后，库视图让位', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }]);
+
+  sandbox.showView('import');
+  assert.equal(els.get('view-main').classList.contains('hide'), true);
+  assert.equal(els.get('view-import').classList.contains('hide'), false);
+
+  sandbox.showView('main');
+  assert.equal(els.get('view-main').classList.contains('hide'), false);
+  assert.equal(els.get('view-import').classList.contains('hide'), true, '回来之后导入视图要收起来');
+});
+
+await test('两个视图的容器都只靠 hide 类切换，没有任何一个被移除', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }]);
+  // 切来切去之后两个容器都还在（不是被删掉再插回来）
+  sandbox.showView('import');
+  sandbox.showView('main');
+  sandbox.showView('import');
+  assert.ok(els.get('view-main') && els.get('view-import'));
+});
+
+await test('评论区被关闭（12061）→ 查不到，不能当成"没了"', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.fetch = async () => ({
+    status: 200,
+    text: async () => JSON.stringify({ code: 12061, message: '当前页面评论功能已关闭' })
+  });
+
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
+  assert.equal(r.state, 'unreachable');
+  assert.match(r.message, /评论功能已经关闭/);
+  assert.ok(!r.transport, '这是接口明确答了，不是链路不通');
+});
+
+await test('认得出"评论功能已关闭"的各种说法（按文案兜底）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  for (const msg of ['当前页面评论功能已关闭', '评论区已关闭', '评论已关闭']) {
+    sandbox.fetch = async () => ({
+      status: 200, text: async () => JSON.stringify({ code: 99999, message: msg })
+    });
+    const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
+    assert.equal(r.state, 'unreachable', `「${msg}」该判成查不到`);
+  }
+});
+
+await test('链路不通会标记 transport —— 这才是该中止整轮的理由', async () => {
+  const { sandbox } = await makeSandbox(async () => { throw new Error('注入失败'); });
+  sandbox.fetch = async () => { throw new Error('网络断了'); };
+  sandbox.window.__bcNativeFetch = sandbox.fetch;
+
+  const r = await sandbox.checkAliveOne({ type: 1, oid: '5', rpid: '999' });
+  assert.equal(r.transport, true);
+  assert.equal(r.state, 'unknown');
+});
+
+console.log('\n— 巡检：不该因为第一条判不出结论就整轮中止 —');
+
+await test('待检查的第一条是"评论功能已关闭"时，后面几条照样要检查（用户反馈的"按键失效"）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([
+      // ctime 最大的排在最前，让它就是那条"评论区关了"的
+      libItem('3', 'unknown', { ctime: 1700000300 }),
+      libItem('2', 'unknown', { ctime: 1700000200 }),
+      libItem('1', 'unknown', { ctime: 1700000100 })
+    ])
+  });
+
+  sandbox.fetch = async (url) => {
+    if (url.indexOf('root=3') >= 0) {
+      return { status: 200, text: async () => JSON.stringify({ code: 12061, message: '当前页面评论功能已关闭' }) };
+    }
+    if (url.indexOf('root=2') >= 0) {
+      return { status: 200, text: async () => JSON.stringify({ code: 12006, message: '没有该评论' }) };
+    }
+    return { status: 200, text: async () => JSON.stringify({ code: 0, data: { root: { rpid: 1 } } }) };
+  };
+
+  await sandbox.probeAicuAlive();
+
+  const lib = await sandbox.getLibrary();
+  assert.equal(lib.items['3'].state, 'unreachable', '第一条该判成「查不到」');
+  assert.equal(lib.items['2'].state, 'gone', '第二条不该因为第一条没结论就被跳过');
+  assert.equal(lib.items['1'].state, 'live', '第三条同理 —— 整轮必须跑完');
+});
+
+await test('链路真的不通时，仍然中止整轮（不能每条都白撞一遍）', async () => {
+  const { sandbox } = await makeSandbox(async () => { throw new Error('注入失败'); }, {
+    seed: seedLibrary([libItem('1', 'unknown'), libItem('2', 'unknown')])
+  });
+  sandbox.fetch = async () => { throw new Error('网络断了'); };
+  sandbox.window.__bcNativeFetch = sandbox.fetch;
+
+  await sandbox.probeAicuAlive();
+
+  const lib = await sandbox.getLibrary();
+  assert.equal(lib.items['1'].state, 'unknown', '链路不通就不该乱记结论');
+  assert.equal(lib.items['2'].state, 'unknown');
+});
+
+await test('「已检查」是除"未检查"之外的全部', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([
+      libItem('1', 'live'), libItem('2', 'gone'),
+      libItem('3', 'unreachable'), libItem('4', 'unknown')
+    ])
+  });
+
+  await sandbox.refreshLibrary();
+  const bar = els.get('lib-states').innerHTML;
+  assert.match(bar, /已检查 <b>3<\/b>/, `实际：${bar}`);
+  assert.match(bar, /未检查 <b>1<\/b>/);
+});
+
+console.log('\n— 三个页面 —');
+
+await test('三个视图互斥：同一时间只显示一个', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }]);
+
+  const state = () => ({
+    main: els.get('view-main').classList.contains('hide'),
+    imp: els.get('view-import').classList.contains('hide'),
+    data: els.get('view-data').classList.contains('hide')
+  });
+
+  sandbox.showView('main');
+  assert.deepEqual(state(), { main: false, imp: true, data: true });
+
+  sandbox.showView('import');
+  assert.deepEqual(state(), { main: true, imp: false, data: true });
+
+  sandbox.showView('data');
+  assert.deepEqual(state(), { main: true, imp: true, data: false });
+
+  sandbox.showView('main');
+  assert.deepEqual(state(), { main: false, imp: true, data: true });
+});
+
+await test('视图名不认识时退回主页，不会三个都藏起来', async () => {
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.showView('乱七八糟');
+  assert.equal(els.get('view-main').classList.contains('hide'), false, '不能把自己的界面藏没了');
+  assert.equal(els.get('view-import').classList.contains('hide'), true);
+  assert.equal(els.get('view-data').classList.contains('hide'), true);
+});
+
+await test('来源标记：自己记录 / 导入分得清', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  assert.match(sandbox.libSourceTag({ source: 'record' }), /tag rec[^>]*>记录/);
+  assert.match(sandbox.libSourceTag({ source: 'aicu' }), /tag aicu[^>]*>导入/);
+  assert.match(sandbox.libSourceTag({}), /导入/, '没标来源的都算导入');
+});
+
+await test('库列表里同时带状态标签和来源标签', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const html = sandbox.libRowHtml({
+    rpid: '1', type: 1, oid: '5', root: '0', rank: 1,
+    message: 'x', ctime: 1700000000, state: 'live', source: 'record'
+  });
+  assert.match(html, /tag live[^>]*>还在/);
+  assert.match(html, /tag rec[^>]*>记录/);
+});
+
+console.log('\n— 库一变，界面自己刷新 —');
+
+await test('库变了就自动重画，不用关掉重开（用户反馈的就是这个）', async () => {
+  const { sandbox, els, fireStorageChange } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([libItem('1', 'live')])
+  });
+
+  await sandbox.refreshLibrary();
+  assert.equal(String(els.get('lib-total').textContent), '1', '先确认渲染出来的是 1 条');
+
+  // 模拟"又发了一条评论"：后台写库 + 存储变化事件
+  await sandbox.upsertLibItems({ items: [libItem('2', 'live', { ctime: 1700000900 })] });
+  fireStorageChange({ bc_library: { newValue: {} } });
+
+  await new Promise(r => setTimeout(r, 500));   // 防抖 300ms
+
+  assert.equal(String(els.get('lib-total').textContent), '2', '界面该自己更新成 2 条');
+});
+
+await test('无关的存储变化不触发重画', async () => {
+  const { sandbox, els, fireStorageChange } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([libItem('1', 'live')])
+  });
+  await sandbox.refreshLibrary();
+  const before = els.get('lib-total').textContent;
+
+  fireStorageChange({ 别的东西: { newValue: 1 } });
+  await new Promise(r => setTimeout(r, 500));
+
+  assert.equal(String(els.get('lib-total').textContent), String(before));
+});
+
+await test('巡检进行中不做自动重画 —— 那两个流程自己会刷，别打架', async () => {
+  const { sandbox, els, fireStorageChange } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([libItem('1', 'live'), libItem('2', 'unknown')])
+  });
+  await sandbox.refreshLibrary();
+
+  sandbox.state.probing = true;                       // 伪造"正在巡检"
+  await sandbox.upsertLibItems({ items: [libItem('3', 'live')] });
+  fireStorageChange({ bc_library: { newValue: {} } });
+  await new Promise(r => setTimeout(r, 500));
+
+  assert.notEqual(String(els.get('lib-total').textContent), '3', '巡检期间不该被自动重画插一脚');
+});
+
+await test('手动在 B 站网页上删了评论，界面也要自己反映出来', async () => {
+  const { sandbox, els, fireStorageChange } = await makeSandbox(async () => [{ result: undefined }], {
+    seed: seedLibrary([libItem('1', 'live'), libItem('2', 'live')])
+  });
+  await sandbox.refreshLibrary();
+  assert.equal(String(els.get('lib-deleted').textContent), '0');
+
+  // 后台 handleDeleted 干的事：把这条标成 deleted（会写库 → 触发存储变化）
+  await sandbox.markLibDeleted(['1']);
+  fireStorageChange({ bc_library: { newValue: {} } });
+  await new Promise(r => setTimeout(r, 500));
+
+  assert.equal(String(els.get('lib-deleted').textContent), '1', '「已删除」那一格该自己跳上去');
+  assert.equal(String(els.get('lib-live').textContent), '1', '「还在」相应减一');
+});
+
+console.log('\n— 自检与通道标签页 —');
+
+await test('注入卡住时，给的是"换标签页"的建议，而不是让用户去刷新页面', async () => {
+  // 用户实测踩到的坑：自检第 1 关（纯注入，不经过内容脚本）超时，
+  // 界面却让他"把那个页面刷新一下再试" —— 刷新解决的是内容脚本失效，
+  // 那是第 2 关的事。建议给错了，用户白折腾。
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+
+  sandbox.chrome.scripting.executeScript = () => new Promise(() => {});   // 永不 settle
+  sandbox.BC_PREFLIGHT_INJECT_MS = 60;                                   // 别真等 8 秒
+  const r = await sandbox.preflight(1);
+
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'inject-timeout', '要能区分出"注入超时"这一类');
+  assert.doesNotMatch(r.reason, /刷新/, '第 1 关不该建议刷新页面');
+  assert.match(r.reason, /标签页/, '该指向标签页本身有问题');
+});
+
+await test('注入失败（抛错）也单独归类，别混进"超时"里', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.chrome.scripting.executeScript = () => Promise.reject(new Error('No tab with id: 9'));
+
+  const r = await sandbox.preflight(9);
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'inject-failed');
+  assert.match(r.reason, /No tab with id/, '原始原因要带出来');
+});
+
+await test('挑通道标签页时，优先用已经加载完的', async () => {
+  // 往还在加载的页面注入脚本，chrome 会一直等到它可用 —— 就是"卡住 8 秒"的常见来源
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.chrome.tabs.query = async () => [
+    { id: 11, status: 'loading' },
+    { id: 22, status: 'complete' },
+    { id: 33, status: 'complete' }
+  ];
+  sandbox.state.workerTabId = null;
+
+  const id = await sandbox.getWorkerTab();
+  assert.equal(id, 22, '应该挑完成态的那个，而不是列表里第一个');
+});
+
+await test('被丢弃的标签页不能用，该新开一个', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  sandbox.chrome.tabs.query = async () => [{ id: 99, status: 'complete', discarded: true }];
+  let created = null;
+  sandbox.chrome.tabs.create = async (o) => { created = o; return { id: 77 }; };
+  sandbox.state.workerTabId = null;
+
+  const id = await sandbox.getWorkerTab();
+  assert.equal(id, 77, 'discarded 的标签页要跳过');
+  assert.equal(created.url, 'https://www.bilibili.com/');
+});
+
+console.log('\n— 巡检范围跟着筛选走 —');
+
+/** 把筛选设成某一个，看 probePlan 怎么说 */
+function planFor(sandbox, filter) {
+  sandbox.state.libStates = filter === 'all' ? [] : [filter];
+  return sandbox.probePlan();
+}
+
+await test('选「未检查」：查未检查的，按钮写「巡检存活」', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const p = planFor(sandbox, 'unknown');
+  assert.equal(p.ok, true);
+  assert.deepEqual(Array.from(p.states), ['unknown']);
+  assert.equal(p.label, '巡检存活');
+});
+
+await test('选「已检查」：重查还在 + 查不到，按钮写「重新检查」', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const p = planFor(sandbox, 'checked');
+  assert.equal(p.ok, true);
+  assert.deepEqual(Array.from(p.states), ['live', 'unreachable'], '已没了和已删除不该被顺带查');
+  assert.equal(p.label, '重新检查');
+});
+
+await test('选「查不到」：重查查不到的', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const p = planFor(sandbox, 'unreachable');
+  assert.equal(p.ok, true);
+  assert.deepEqual(Array.from(p.states), ['unreachable']);
+  assert.equal(p.label, '重新检查');
+});
+
+await test('选「还在」：重查还在的', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const p = planFor(sandbox, 'live');
+  assert.equal(p.ok, true);
+  assert.deepEqual(Array.from(p.states), ['live']);
+});
+
+await test('选「全部」：查还在 + 查不到 + 未检查，也不碰已没了 / 已删除', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const p = planFor(sandbox, 'all');
+  assert.equal(p.ok, true);
+  assert.deepEqual(Array.from(p.states), ['live', 'unreachable', 'unknown']);
+  assert.ok(!p.states.includes('gone') && !p.states.includes('deleted'),
+    '结论已定的两条不该被顺带扫进去');
+});
+
+await test('选「已没了」：按钮置灰，并说明为什么', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const p = planFor(sandbox, 'gone');
+  assert.equal(p.ok, false, '已没了不该能再查');
+  assert.deepEqual(Array.from(p.states), []);
+  assert.match(p.why, /确定/, '要说明原因，而不是默默禁用');
+});
+
+await test('选「已删除」：按钮置灰', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  const p = planFor(sandbox, 'deleted');
+  assert.equal(p.ok, false);
+  assert.deepEqual(Array.from(p.states), []);
+});
+
+await test('按钮状态和实际检查范围用的是同一条规则', async () => {
+  // 防"两处各写一份、然后分叉"：按钮说能查、点了却说不该查。
+  const { sandbox, els } = await makeSandbox(async () => [{ result: undefined }]);
+
+  sandbox.state.probing = false;
+  sandbox.state.autoRunning = false;
+  sandbox.state.running = false;
+
+  for (const f of ['unknown', 'checked', 'live', 'unreachable', 'all', 'gone', 'deleted']) {
+    const p = planFor(sandbox, f);
+    sandbox.refreshAicuButtons();
+
+    const btn = els.get('btn-aicu-probe');
+    assert.equal(btn.disabled, !p.ok, `选「${f}」时按钮的禁用状态和 probePlan 对不上`);
+    assert.equal(btn.textContent, p.label, `选「${f}」时按钮文案和 probePlan 对不上`);
+  }
+});
+
+await test('已没了 / 已删除置灰后，真的点不动（probeAicuAlive 直接返回）', async () => {
+  const { sandbox } = await makeSandbox(async () => [{ result: undefined }]);
+  planFor(sandbox, 'gone');
+  sandbox.state.probing = false;
+
+  await sandbox.probeAicuAlive();
+  assert.equal(sandbox.state.probing, false, '不该真的开跑');
+});
+
+/* ---------------------------------------------------------------- 汇总 */
+
+console.log(`\n通过 ${passed} 项，失败 ${failed} 项\n`);
+process.exit(failed === 0 ? 0 : 1);

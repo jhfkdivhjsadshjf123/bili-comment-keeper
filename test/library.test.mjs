@@ -1,0 +1,698 @@
+/**
+ * library.test.mjs —— 评论库（v1.5 起的权威数据源）的回归测试
+ *
+ * 定位变了：这个扩展的核心从「批量删评论」变成「本地评论管理 + 备份」，
+ * 数据也从收藏夹搬到 chrome.storage.local 里的一份「库」。库是地基，
+ * 它错了上面全错，所以这里测得比较狠。
+ *
+ * 纯 Node，零依赖：node test/library.test.mjs
+ */
+
+import assert from 'node:assert/strict';
+import { loadSrc } from './load-src.mjs';
+
+let passed = 0, failed = 0;
+
+async function test(name, fn) {
+  try {
+    await fn();
+    console.log(`  \u2713 ${name}`);
+    passed++;
+  } catch (e) {
+    console.error(`  \u2717 ${name}`);
+    console.error(`      ${(e && e.message) || e}`);
+    failed++;
+  }
+}
+
+/* ------------------------------------------------------- 假的 chrome.storage */
+
+const localData = new Map();
+
+globalThis.chrome = {
+  storage: {
+    local: {
+      async get(keys) {
+        const out = {};
+        const list = Array.isArray(keys) ? keys : (typeof keys === 'string' ? [keys] : Object.keys(keys || {}));
+        for (const k of list) if (localData.has(k)) out[k] = localData.get(k);
+        return out;
+      },
+      async set(obj) { for (const k of Object.keys(obj)) localData.set(k, obj[k]); },
+      async remove(keys) {
+        for (const k of (Array.isArray(keys) ? keys : [keys])) localData.delete(k);
+      }
+    }
+  }
+};
+
+const shared = await loadSrc();   // src/ 拆成多模块了，集中在这里合并
+const {
+  K_LIBRARY, K_AICU,
+  getLibrary, saveLibrary, upsertLibItems, setLibStates, markLibDeleted,
+  removeLibItems, listLibItems, libraryStats, queryLib, liveComments,
+  saveVideoTitles, videoKey,
+  fillVideoTitles,
+  exportLibraryJSON, exportLibraryHTML, exportLibraryMarkdown, importLibraryJSON,
+  normalizeLibItem, clearLibrary, setOwnerUid, allowAltUid, forgetAltUid,
+} = shared;
+
+/* 测试用的主账号。库现在绑定账号，每个用例都得先有一个 ——
+ * 以前是随便传个 uid: OWNER 就完事，现在那样会被账号准入挡掉。 */
+const OWNER = '900001';
+async function freshLib() {
+  localData.clear();
+  await setOwnerUid(OWNER);
+}
+
+const item = (rpid, extra) => Object.assign({
+  rpid: rpid, type: 1, oid: '555', root: '0', rank: 1,
+  message: '评论 ' + rpid, ctime: 1700000000
+}, extra || {});
+
+console.log('\n评论库（数据层）回归测试\n');
+console.log('— 老数据迁移 —');
+
+await test('库已经存在时不再看老键', async () => {
+  await freshLib();
+  localData.set(K_AICU, { items: { '1': item('1') } });
+  localData.set(K_LIBRARY, { items: { '9': item('9') } });
+
+  const lib = await getLibrary();
+  assert.ok(lib.items['9']);
+  assert.ok(!lib.items['1'], '不该混进老数据');
+});
+
+await test('normalizeLibItem：来源标记与状态都规整得住', async () => {
+  assert.equal(normalizeLibItem(item('1', { source: 'record' })).source, 'record');
+  assert.equal(normalizeLibItem(item('1')).source, 'aicu', '没标来源的一律算导入的');
+  assert.equal(normalizeLibItem(item('1', { state: 'live' })).state, 'live');
+  assert.equal(normalizeLibItem(item('1')).state, 'unknown', '状态不认识就当没查过');
+  assert.equal(normalizeLibItem(item('1', { state: '乱七八糟' })).state, 'unknown');
+  assert.equal(normalizeLibItem({ rpid: 'x' }), null, '缺关键字段要丢掉');
+});
+
+console.log('\n— 写操作 —');
+
+await test('upsert：新增、去重、补全缺失字段', async () => {
+  await freshLib();
+  let r = await upsertLibItems({ uid: OWNER, total: 100, items: [item('1'), item('2')] });
+  assert.equal(r.added, 2);
+
+  r = await upsertLibItems({ uid: OWNER, items: [item('1'), item('3')] });
+  assert.equal(r.added, 1, '已有的不该重复加');
+  assert.equal(r.total, 3);
+
+  // 老条目没有正文和时间，重新导入时应该补上
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1', { message: '', ctime: 0 })] });
+  await upsertLibItems({ uid: OWNER, items: [item('1', { message: '补上的', ctime: 12345 })] });
+  const lib = await getLibrary();
+  assert.equal(lib.items['1'].message, '补上的');
+  assert.equal(lib.items['1'].ctime, 12345);
+});
+
+await test('upsert：重新导入不会冲掉已有的存活结论', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1', { message: '' })] });
+  await setLibStates({ 1: 'gone' });
+  await upsertLibItems({ uid: OWNER, items: [item('1', { message: '又导了一遍' })] });
+
+  const lib = await getLibrary();
+  assert.equal(lib.items['1'].state, 'gone', '探测结论是花时间换来的，不能被导入冲掉');
+  assert.equal(lib.items['1'].message, '又导了一遍');
+});
+
+await test('upsert：换个 UID 导入会被拒绝，一条都不写', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1')] });
+
+  const r = await upsertLibItems({ uid: '999999', items: [item('2')] });
+  assert.equal(r.refused, true, '别人的 UID 要拒掉');
+  assert.equal(r.code, 'not-owner');
+  assert.equal(r.added, 0);
+
+  const lib = await getLibrary();
+  assert.equal(Object.keys(lib.items).length, 1, '库里还是只有自己那一条');
+  assert.equal(lib.items['2'], undefined, '别人的评论一条都不能进来');
+  assert.equal(lib.uid, OWNER, '主账号不能被覆盖');
+});
+
+await test('upsert：还没设主账号时，带 UID 的导入也拒绝（code: no-owner）', async () => {
+  localData.clear();                       // 故意不设主账号
+  const r = await upsertLibItems({ uid: '123456', items: [item('1')] });
+  assert.equal(r.refused, true);
+  assert.equal(r.code, 'no-owner');
+  assert.equal(Object.keys((await getLibrary()).items).length, 0);
+});
+
+await test('upsert：确认过的小号可以导入', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1')] });
+
+  await allowAltUid('888888');
+  const r = await upsertLibItems({ uid: '888888', items: [item('2')] });
+  assert.equal(r.refused, undefined, '认过的小号不该被拦');
+  assert.equal(r.added, 1);
+
+  const lib = await getLibrary();
+  assert.equal(lib.items['2'].uid, '888888', '条目要记住它属于哪个账号');
+  assert.equal(lib.items['1'].uid, OWNER);
+});
+
+await test('setOwnerUid：设置一次就好，之后不许改成别的；allowAltUid 能撤销', async () => {
+  localData.clear();
+  assert.equal((await setOwnerUid('abc')).ok, false, 'UID 只能是数字');
+  assert.equal((await setOwnerUid('')).ok, false);
+
+  assert.equal((await setOwnerUid(OWNER)).ok, true);
+  assert.equal((await getLibrary()).uid, OWNER);
+
+  const again = await setOwnerUid('123456');
+  assert.equal(again.ok, false, '已经绑了就不许改 —— 要换账号得先清库');
+  assert.equal((await getLibrary()).uid, OWNER);
+
+  await allowAltUid('888888');
+  assert.deepEqual((await getLibrary()).altUids, ['888888']);
+  await allowAltUid('888888');
+  assert.deepEqual((await getLibrary()).altUids, ['888888'], '重复加不该出现两条');
+  await allowAltUid(OWNER);
+  assert.deepEqual((await getLibrary()).altUids, ['888888'], '主账号不该混进小号列表');
+
+  await forgetAltUid('888888');
+  assert.deepEqual((await getLibrary()).altUids, []);
+});
+
+await test('setLibStates：记下结论和检查时间', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1'), item('2')] });
+
+  const before = Date.now();
+  await setLibStates({ 1: 'live', 2: 'gone' });
+  const lib = await getLibrary();
+
+  assert.equal(lib.items['1'].state, 'live');
+  assert.equal(lib.items['2'].state, 'gone');
+  assert.ok(lib.items['1'].aliveCheckedAt >= before, '要记下上次检查时间');
+  assert.ok(lib.items['2'].goneAt >= before, '第一次发现没了要记下时间');
+  assert.ok(lib.probedAt >= before, '整库巡检时间也要更新');
+});
+
+await test('setLibStates：goneAt 只记第一次，重复巡检不会把它刷新', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1')] });
+
+  await setLibStates({ 1: 'gone' });
+  const first = (await getLibrary()).items['1'].goneAt;
+
+  await new Promise(r => setTimeout(r, 12));
+  await setLibStates({ 1: 'gone' });
+  const again = (await getLibrary()).items['1'].goneAt;
+
+  assert.equal(again, first, '"哪一刻没的"是历史事实，不能被后来的巡检改写');
+});
+
+await test('setLibStates：又活了就把 goneAt 清掉', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1')] });
+  await setLibStates({ 1: 'gone' });
+  assert.ok((await getLibrary()).items['1'].goneAt);
+
+  await setLibStates({ 1: 'live' });
+  const lib = await getLibrary();
+  assert.equal(lib.items['1'].state, 'live');
+  assert.equal(lib.items['1'].goneAt, undefined, '既然还在，就不该留着"没了"的时间');
+});
+
+await test('markLibDeleted：我们自己删掉的那些有独立状态', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1'), item('2')] });
+  const n = await markLibDeleted(['1']);
+  assert.equal(n, 1);
+
+  const lib = await getLibrary();
+  assert.equal(lib.items['1'].state, 'deleted');
+  assert.ok(lib.items['1'].deletedAt);
+  assert.equal(lib.items['2'].state, 'unknown', '没删的不受影响');
+});
+
+await test('removeLibItems：只删指定的', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1'), item('2'), item('3')] });
+  assert.equal(await removeLibItems(['1', '3', '999']), 2, '不存在的 rpid 不算数');
+
+  const lib = await getLibrary();
+  assert.deepEqual(Object.keys(lib.items), ['2']);
+});
+
+await test('视频标题缓存：存进去、查询时能带出来', async () => {
+  // 注意：**主动去拉标题的功能（「拉视频标题」按钮）已经删掉了** ——
+  // 用户觉得没用。但这份缓存还在，因为「导入备份」会把备份里的标题写回来，
+  // 导出 HTML / Markdown 时也要用（显示 UP 主）。
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1'), item('2', { oid: '777' })] });
+
+  await saveVideoTitles({
+    [videoKey(1, '555')]: { title: '视频甲', bvid: 'BV1', owner: 'UP甲' }
+  });
+
+  const q = await queryLib({ limit: 10 });
+  const one = q.items.find(it => it.oid === '555');
+  const two = q.items.find(it => it.oid === '777');
+  assert.equal(one.video.title, '视频甲', '有缓存就带出来');
+  assert.equal(one.video.owner, 'UP甲');
+  assert.equal(two.video, null, '没缓存的就是 null');
+});
+
+console.log('\n— 查询：搜索 / 筛选 / 排序 / 分页 —');
+
+async function seedLib() {
+  await freshLib();
+  const items = [];
+  for (let i = 1; i <= 30; i++) {
+    items.push(item(String(i), {
+      oid: i <= 10 ? '555' : (i <= 20 ? '666' : '777'),
+      message: i % 3 === 0 ? '这是特殊评论 ' + i : '普通评论 ' + i,
+      ctime: 1000 + i
+    }));
+  }
+  await upsertLibItems({ uid: OWNER, items: items });
+  const marks = {};
+  for (let i = 1; i <= 10; i++) marks[String(i)] = 'live';
+  for (let i = 11; i <= 20; i++) marks[String(i)] = 'gone';
+  await setLibStates(marks);
+}
+
+await test('查库：按状态筛选', async () => {
+  await seedLib();
+  const live = await queryLib({ states: ['live'] });
+  assert.equal(live.total, 10);
+  const gone = await queryLib({ states: ['gone'] });
+  assert.equal(gone.total, 10);
+  const unknown = await queryLib({ states: ['unknown'] });
+  assert.equal(unknown.total, 10);
+});
+
+await test('查库：搜索命中正文，也命中 rpid / oid', async () => {
+  await seedLib();
+  const byText = await queryLib({ q: '特殊' });
+  assert.equal(byText.total, 10, '3,6,9…30 共 10 条');
+
+  const byRpid = await queryLib({ q: '15' });
+  assert.ok(byRpid.total >= 1);
+  assert.ok(byRpid.items.some(i => i.rpid === '15'));
+
+  const byOid = await queryLib({ q: '666' });
+  assert.equal(byOid.total, 10, '11~20 这十条属于 oid 666');
+});
+
+await test('查库：分页必须真的分页（几千条不能一次塞进 DOM）', async () => {
+  await seedLib();
+  const p1 = await queryLib({ limit: 12, offset: 0 });
+  const p2 = await queryLib({ limit: 12, offset: 12 });
+  const p3 = await queryLib({ limit: 12, offset: 24 });
+
+  assert.equal(p1.total, 30);
+  assert.equal(p1.items.length, 12);
+  assert.equal(p2.items.length, 12);
+  assert.equal(p3.items.length, 6, '最后一页只剩 6 条');
+
+  const ids = new Set([...p1.items, ...p2.items, ...p3.items].map(i => i.rpid));
+  assert.equal(ids.size, 30, '三页之间不能重复');
+});
+
+await test('查库：时间倒序 / 正序', async () => {
+  await seedLib();
+  const desc = await queryLib({ sort: 'time-desc', limit: 3 });
+  assert.deepEqual(desc.items.map(i => i.rpid), ['30', '29', '28']);
+
+  const asc = await queryLib({ sort: 'time-asc', limit: 3 });
+  assert.deepEqual(asc.items.map(i => i.rpid), ['1', '2', '3']);
+});
+
+await test('查库：limit 有上限，防止有人一把要十万条', async () => {
+  await seedLib();
+  const r = await queryLib({ limit: 999999 });
+  assert.ok(r.limit <= 500, `实际 limit=${r.limit}`);
+});
+
+await test('查库：顺带把视频标题带上', async () => {
+  await seedLib();
+  await saveVideoTitles({ [videoKey(1, '555')]: { title: '视频甲' } });
+  const r = await queryLib({ q: '5', limit: 50 });
+  const hit = r.items.find(i => i.oid === '555');
+  assert.ok(hit);
+  assert.equal(hit.video.title, '视频甲');
+});
+
+await test('libraryStats：各状态计数 + 涉及多少视频 / 有多少已缓存标题', async () => {
+  await seedLib();
+  assert.equal((await libraryStats()).titled, 0, '刚种下的库里还没有标题缓存');
+
+  await saveVideoTitles({ [videoKey(1, '555')]: { title: '视频甲' } });
+
+  const s = await libraryStats();
+  assert.equal(s.total, 30);
+  assert.equal(s.live, 10);
+  assert.equal(s.gone, 10);
+  assert.equal(s.unknown, 10);
+  assert.equal(s.videos, 3, '555 / 666 / 777 三个视频');
+  assert.equal(s.titled, 1, '只有 555 缓存过标题');
+});
+
+console.log('\n— 导出 / 导入 —');
+
+await test('导出 JSON：能原样导回来（含存活结论和视频标题）', async () => {
+  await seedLib();
+  await saveVideoTitles({ [videoKey(1, '555')]: { title: '视频甲', bvid: 'BV1', owner: 'UP甲' } });
+
+  const json = await exportLibraryJSON();
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.format, 'bili-comment-keeper/library');
+  assert.equal(parsed.count, 30);
+  assert.ok(parsed.videos[videoKey(1, '555')], '视频标题要一起导出，否则导回来只剩 av 号');
+
+  // 清空再从备份恢复
+  await freshLib();
+  const r = await importLibraryJSON(json);
+  assert.equal(r.ok, true);
+  assert.equal(r.total, 30);
+
+  const lib = await getLibrary();
+  assert.equal(lib.items['1'].state, 'live', '存活结论要跟着回来，否则全变成"未检查"');
+  assert.equal(lib.items['15'].state, 'gone');
+  assert.equal(lib.videos[videoKey(1, '555')].title, '视频甲');
+});
+
+await test('导入：不是备份文件就明确拒绝', async () => {
+  await freshLib();
+  assert.equal((await importLibraryJSON('不是 json')).ok, false);
+  assert.equal((await importLibraryJSON('{"a":1}')).ok, false);
+  assert.equal((await importLibraryJSON('[]')).ok, false);
+});
+
+await test('导出 HTML：自包含、能离线打开、条目都在', async () => {
+  await seedLib();
+  await saveVideoTitles({ [videoKey(1, '555')]: { title: '视频甲', owner: 'UP甲' } });
+
+  const html = await exportLibraryHTML('我的评论备份');
+  assert.match(html, /^<!DOCTYPE html>/);
+  assert.match(html, /我的评论备份/);
+  assert.match(html, /视频甲/);
+  assert.match(html, /方式0/);
+  assert.match(html, /方式2/);
+  assert.match(html, /还在 10/);
+  assert.ok(html.indexOf('<link') < 0 && html.indexOf('<script') < 0,
+    '不能引用外部资源 —— 离线打开要能正常看');
+});
+
+await test('导出的 HTML 必须转义正文 —— 评论内容来自互联网', async () => {
+  await freshLib();
+  await upsertLibItems({
+    uid: OWNER,
+    items: [item('1', { message: '<script>alert(1)</script><img src=x onerror=alert(2)>' })]
+  });
+
+  const html = await exportLibraryHTML('测试');
+  assert.ok(html.indexOf('<script>alert(1)</script>') < 0, '原始 script 标签绝不能写进导出文件');
+  assert.ok(html.indexOf('&lt;script&gt;') >= 0, '应该转义成实体');
+  assert.ok(html.indexOf('<img') < 0, '标签本身也必须被转义掉');
+});
+
+await test('导出 Markdown：条目、链接、状态都在', async () => {
+  await seedLib();
+  const md = await exportLibraryMarkdown('我的备份');
+  assert.match(md, /^# 我的备份/);
+  assert.match(md, /共 30 条/);
+  assert.match(md, /\[方式0\]\(https:\/\//);
+  assert.match(md, /\[方式2\]\(https:\/\//);
+  assert.match(md, /rpid `1`/);
+});
+
+await test('导出 Markdown：正文里的换行不会把结构撑坏', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1', { message: '第一行\n第二行\n## 假标题' })] });
+
+  const md = await exportLibraryMarkdown('测试');
+  const bodyLines = md.split('\n').filter(l => l.indexOf('第一行') >= 0);
+  assert.ok(bodyLines.length, '正文应该在');
+  assert.ok(bodyLines[0].startsWith('> '), '多行正文要走引用块，不能裸着插进来');
+});
+
+await test('准入规则：只有 live / unknown / unreachable 值得为它发一次删除请求', async () => {
+  const { isDeletable } = shared;
+  assert.equal(isDeletable('live'), true, '确认还在 —— 该删');
+  assert.equal(isDeletable('unknown'), true, '还没查过 —— 删一次正好当探测');
+  assert.equal(isDeletable('unreachable'), true,
+    '查不到 ≠ 没了 —— 视频不可访问时评论可能还在，不能因为查不到就把它排除掉');
+  assert.equal(isDeletable('gone'), false, '已经没了 —— 再问只会拿到 12022，白费一次请求');
+  assert.equal(isDeletable('deleted'), false, '我们自己删过了 —— 同理');
+  assert.equal(isDeletable(undefined), false, '状态不明的一律不放行');
+  assert.equal(isDeletable('乱七八糟'), false);
+});
+
+await test('unreachable 是独立的一态：计数、筛选、文案都要有它', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1'), item('2'), item('3')] });
+  await setLibStates({ 1: 'live', 2: 'unreachable', 3: 'gone' });
+
+  const s = await libraryStats();
+  assert.equal(s.unreachable, 1, '统计里要有这一格');
+  assert.equal(s.live, 1);
+  assert.equal(s.gone, 1);
+
+  const only = await queryLib({ states: ['unreachable'] });
+  assert.equal(only.total, 1, '要能单独筛出来');
+  assert.equal(only.items[0].rpid, '2');
+
+  assert.equal(shared.stateText('unreachable'), '查不到');
+});
+
+await test('检查结论的原因会存下来（光显示"查不到"没法排查）', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1')] });
+
+  await setLibStates({ 1: { state: 'unreachable', note: '视频/评论区访问不到（啥都木有）' } });
+  let lib = await getLibrary();
+  assert.equal(lib.items['1'].state, 'unreachable');
+  assert.match(lib.items['1'].note, /访问不到/);
+
+  // 换成别的结论时原因要跟着换，不能留着旧的那句
+  await setLibStates({ 1: { state: 'live' } });
+  lib = await getLibrary();
+  assert.equal(lib.items['1'].state, 'live');
+  assert.ok(!lib.items['1'].note, '换了结论就不该留着上一次的原因');
+});
+
+console.log('\n— 自动记录进库（之前断掉的那一环） —');
+
+await test('自己记录下来的评论会进库，并且在统计里单列', async () => {
+  await freshLib();
+
+  // 模拟 handleRecord 写库时的那份数据
+  await upsertLibItems({
+    items: [{
+      rpid: '111', type: 1, oid: '555', root: '0', rank: 1,
+      message: '刚发的评论', ctime: 1700000000, state: 'live', source: 'record'
+    }]
+  });
+
+  const lib = await getLibrary();
+  assert.equal(lib.items['111'].state, 'live', '刚发出去的肯定是活的');
+  assert.equal(lib.items['111'].source, 'record', '要能分辨"自己记录的"和"导入的"');
+  assert.ok(lib.items['111'].firstSeen, '要记住第一次见到它的时间');
+
+  await upsertLibItems({ items: [item('222')] });
+  const s = await libraryStats();
+  assert.equal(s.recorded, 1, '自己记录的 1 条');
+  assert.equal(s.imported, 1, '导入的 1 条');
+  assert.equal(s.total, 2);
+});
+
+await test('记录比导入可信：同一条被导入覆盖时来源不会被改回去', async () => {
+  await freshLib();
+  await upsertLibItems({ items: [{ rpid: '111', type: 1, oid: '555', state: 'live', source: 'record' }] });
+  await upsertLibItems({ items: [item('111')] });        // 导入里也有这条
+
+  const lib = await getLibrary();
+  assert.equal(lib.items['111'].source, 'record', '来源不该被导入冲掉');
+});
+
+await test('查库：按来源筛选（自己记录 vs aicu 导入）', async () => {
+  await freshLib();
+  await upsertLibItems({ items: [
+    { rpid: '1', type: 1, oid: '555', state: 'live', source: 'record' },
+    { rpid: '2', type: 1, oid: '555', state: 'live', source: 'record' }
+  ] });
+  await upsertLibItems({ items: [item('3'), item('4'), item('5')] });   // 默认算导入
+
+  assert.equal((await queryLib({})).total, 5);
+  assert.equal((await queryLib({ source: 'record' })).total, 2);
+  assert.equal((await queryLib({ source: 'aicu' })).total, 3);
+  assert.equal((await queryLib({ source: '瞎写' })).total, 5, '来源不认识就当不筛');
+
+  // 来源和状态能一起用
+  await setLibStates({ 1: 'gone' });
+  assert.equal((await queryLib({ source: 'record', states: ['gone'] })).total, 1);
+});
+
+await test('clearLibrary：把整库清掉（数据页的「删除整个评论库」）', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1'), item('2')] });
+  await saveVideoTitles({ [videoKey(1, '555')]: { title: '视频甲' } });
+  assert.equal((await libraryStats()).total, 2);
+
+  await clearLibrary();
+
+  const s = await libraryStats();
+  assert.equal(s.total, 0, '库要真的空掉');
+  assert.equal(s.videos, 0, '视频标题缓存跟着一起清');
+  assert.equal((await listLibItems()).length, 0);
+});
+
+console.log('\n— 给 B 站消息页「我的评论」栏的数据 —');
+
+await test('liveComments：只给还在的，且按时间倒序', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [
+    item('1', { ctime: 100 }),
+    item('2', { ctime: 300 }),
+    item('3', { ctime: 200 }),
+    item('4'), item('5')
+  ] });
+  await setLibStates({ 1: 'live', 2: 'live', 3: 'live', 4: 'gone', 5: 'deleted' });
+
+  const r = await liveComments(50);
+  assert.equal(r.total, 3, 'total 是"还在"的总数');
+  assert.deepEqual(Array.from(r.items, x => x.rpid), ['2', '3', '1'], '新的在前');
+  assert.ok(!r.items.some(x => x.rpid === '4' || x.rpid === '5'),
+    '已没了和已删除的一条都不能出现');
+});
+
+await test('liveComments：给页面的是可以直接渲染的扁平字段', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1', { message: '正文在这', ctime: 1700000000 })] });
+  await setLibStates({ 1: 'live' });
+  await saveVideoTitles({ [videoKey(1, '555')]: { title: '视频甲' } });
+
+  const one = (await liveComments(10)).items[0];
+  assert.equal(one.message, '正文在这');
+  assert.equal(one.video, '视频甲', '有缓存标题就带上');
+  assert.ok(one.when, '要有给人看的时间');
+  assert.equal(one.kind, '一级评论');
+  assert.match(one.url, /bilibili\.com/, '要能点开');
+  assert.equal(one.rpid, '1');
+  // 来源页：短标签 + 地址。没缓存标题时页面上显示的就是这个标签，
+  // 不然只能写"（标题未缓存）"那种废话。
+  assert.equal(one.page, 'av555', 'type=1 的短标签是 av<oid>');
+  assert.equal(one.pageUrl, 'https://www.bilibili.com/video/av555');
+});
+
+await test('liveComments：专栏和动态也能给出对的短标签', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [
+    item('1', { type: 12, oid: '888' }),
+    item('2', { type: 17, oid: '999' })
+  ] });
+  await setLibStates({ 1: 'live', 2: 'live' });
+
+  const byOid = {};
+  for (const x of (await liveComments(10)).items) byOid[x.rpid] = x;
+  assert.equal(byOid['1'].page, 'cv888');
+  assert.equal(byOid['1'].pageUrl, 'https://www.bilibili.com/read/cv888');
+  assert.match(byOid['2'].page, /999/);
+});
+
+await test('liveComments：楼中楼标成「楼中楼」', async () => {
+  await freshLib();
+  await upsertLibItems({ uid: OWNER, items: [item('1', { rank: 2, root: '9' })] });
+  await setLibStates({ 1: 'live' });
+  assert.equal((await liveComments(10)).items[0].kind, '楼中楼');
+});
+
+await test('liveComments：条数上限夹住，但 total 不受上限影响', async () => {
+  await freshLib();
+  const items = [];
+  for (let i = 1; i <= 12; i++) items.push(item(String(i), { ctime: i }));
+  await upsertLibItems({ uid: OWNER, items: items });
+  for (let i = 1; i <= 12; i++) await setLibStates({ [String(i)]: 'live' });
+
+  const r = await liveComments(5);
+  assert.equal(r.shown, 5, '只返回 5 条');
+  assert.equal(r.total, 12, '但总数要如实说 12，页面才好写"这里显示最近 N 条"');
+  assert.equal((await liveComments(9999)).shown, 12, '超过总数就全给');
+  // 没给 / 0 / 负数 / 非数字 一律当"没给"，用默认 100 —— 不夹到 1，那对调用方太意外
+  assert.equal((await liveComments(0)).shown, 12, '0 当没给');
+  assert.equal((await liveComments(-5)).shown, 12, '负数同理');
+  assert.equal((await liveComments()).shown, 12, '不给参数');
+  assert.equal((await liveComments('abc')).shown, 12, '不是数字也当没给');
+});
+
+console.log('\n— 按需补视频标题 —');
+
+await test('fillVideoTitles：只抓视频，专栏/动态跳过；抓到的进缓存', async () => {
+  await freshLib();
+  const asked = [];
+  globalThis.fetch = async (url) => {
+    asked.push(url);
+    return { ok: true, json: async () => ({ code: 0, data: { title: '标题' + asked.length, bvid: 'BV1', owner: { name: 'UP' } } }) };
+  };
+
+  const map = await fillVideoTitles([
+    { type: 1, oid: '555' },
+    { type: 12, oid: '888' },      // 专栏：接口不一样，跳过
+    { type: 17, oid: '999' }       // 动态：同上
+  ], 10);
+
+  assert.equal(asked.length, 1, '只该为那个视频发一次请求');
+  assert.match(asked[0], /aid=555/);
+  assert.equal(map[videoKey(1, '555')].title, '标题1');
+  assert.equal(Object.keys(map).length, 1);
+  assert.equal((await getLibrary()).videos[videoKey(1, '555')].title, '标题1', '要落盘缓存');
+});
+
+await test('fillVideoTitles：已经缓存过的不再请求（每个视频只抓一次）', async () => {
+  await freshLib();
+  await saveVideoTitles({ [videoKey(1, '555')]: { title: '早就有了' } });
+
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; return { ok: true, json: async () => ({ code: 0, data: { title: 'x' } }) }; };
+
+  const map = await fillVideoTitles([{ type: 1, oid: '555' }], 10);
+  assert.equal(calls, 0, '缓存命中就不该发请求');
+  assert.deepEqual(Object.keys(map), []);
+});
+
+await test('fillVideoTitles：同一批里的重复视频只抓一次，且受 limit 限制', async () => {
+  await freshLib();
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; return { ok: true, json: async () => ({ code: 0, data: { title: 'T' } }) }; };
+
+  await fillVideoTitles([
+    { type: 1, oid: '1' }, { type: 1, oid: '1' }, { type: 1, oid: '1' }
+  ], 10);
+  assert.equal(calls, 1, '重复的 oid 只算一个');
+
+  calls = 0;
+  await fillVideoTitles([
+    { type: 1, oid: '11' }, { type: 1, oid: '12' }, { type: 1, oid: '13' }, { type: 1, oid: '14' }
+  ], 2);
+  assert.equal(calls, 2, 'limit 是硬上限');
+});
+
+await test('fillVideoTitles：请求失败 / 视频没了就当作拿不到，不抛异常', async () => {
+  await freshLib();
+  globalThis.fetch = async () => ({ ok: false, json: async () => ({}) });
+  assert.deepEqual(Object.keys(await fillVideoTitles([{ type: 1, oid: '1' }], 5)), []);
+
+  globalThis.fetch = async () => { throw new Error('断网'); };
+  assert.deepEqual(Object.keys(await fillVideoTitles([{ type: 1, oid: '2' }], 5)), []);
+
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ code: -404, message: '啥都木有' }) });
+  assert.deepEqual(Object.keys(await fillVideoTitles([{ type: 1, oid: '3' }], 5)), []);
+});
+
+/* ---------------------------------------------------------------- 汇总 */
+
+console.log(`\n通过 ${passed} 项，失败 ${failed} 项\n`);
+process.exit(failed === 0 ? 0 : 1);

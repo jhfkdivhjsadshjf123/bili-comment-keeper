@@ -1,0 +1,255 @@
+/* my-comments-panel.js 注入到 B 站消息页的那一栏的样式
+ *
+ * 两条原则：
+ *   1. 只写自己这套 `bc-` 类，**不去改它页面上的任何东西**。
+ *      左侧栏那一栏直接复用 B 站自己的类名（message-sidebar__item / is-active），
+ *      所以看起来就是原生的，不需要在这里画。
+ *   2. 颜色一律用它自己的 CSS 变量（--text1 / --text2 / --brand_blue / --bg1 / --bg2），
+ *      亮色 / 暗色主题就都跟着走了。
+ *
+ * 排版对着它原生的「收到的赞」那一页做的：标题横带 + 一条条带分隔线的行，
+ * 正文是主体，元信息小字压在下面，操作放右端。
+ */
+
+.bc-mine {
+  padding: 0 24px 40px;
+  color: var(--text1, #18191c);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+/* 标题横带 —— 和它自己那个「收到的赞」标题条同一种做法 */
+.bc-mine__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--bg1, #e3e5e7);
+}
+
+.bc-mine__title {
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.bc-mine__count {
+  color: var(--text2, #9499a0);
+  font-size: 12px;
+}
+
+.bc-mine__meta {
+  padding: 10px 0 2px;
+  color: var(--text2, #9499a0);
+  font-size: 12px;
+}
+
+.bc-mine__meta:empty { display: none; }
+
+/* 列表容器本身不额外留白，行自己带内边距 */
+.bc-mine__list { margin-top: 2px; }
+
+/* 一行评论 */
+.bc-mine__row {
+  padding: 14px 8px;
+  margin: 0 -8px;
+  border-bottom: 1px solid var(--bg1, #e3e5e7);
+  border-radius: 4px;
+  transition: background-color .15s;
+}
+
+.bc-mine__row:hover { background: var(--bg1, #f1f2f3); }
+
+.bc-mine__text {
+  color: var(--text1, #18191c);
+  word-break: break-word;
+  /* 太长的评论压到 3 行，免得一条就把屏幕占满；全文在 title 里 */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.bc-mine__line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6px;
+  color: var(--text2, #9499a0);
+  font-size: 12px;
+}
+
+.bc-mine__facts {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bc-mine__sep { margin: 0 6px; opacity: .55; }
+
+.bc-mine__src {
+  color: var(--text2, #9499a0);
+  text-decoration: none;
+}
+
+a.bc-mine__src:hover { color: var(--brand_blue, #00aeec); }
+
+.bc-mine__acts {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+}
+
+.bc-mine__open {
+  color: var(--brand_blue, #00aeec);
+  text-decoration: none;
+}
+
+.bc-mine__open:hover { text-decoration: underline; }
+
+/* 删除：平时低调，悬停才变红 —— 免得误点 */
+.bc-mine__del {
+  border: 0;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text2, #9499a0);
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.bc-mine__del:hover { color: #f2555a; }
+
+/* ------------------------------------------------------------ 确认弹窗 */
+
+.bc-mine__mask {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, .55);
+}
+
+.bc-mine__dialog {
+  width: min(420px, calc(100vw - 48px));
+  background: var(--bg2, #fff);
+  border: 1px solid var(--bg1, #e3e5e7);
+  border-radius: 8px;
+  padding: 20px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, .35);
+}
+
+.bc-mine__dialog-title {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+
+.bc-mine__dialog-quote {
+  max-height: 120px;
+  overflow: auto;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--bg1, #f1f2f3);
+  color: var(--text2, #61666d);
+  font-size: 13px;
+  word-break: break-word;
+}
+
+.bc-mine__dialog-warn {
+  margin-top: 12px;
+  color: #f2555a;
+  font-size: 12px;
+}
+
+.bc-mine__dialog-acts {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.bc-mine__btn {
+  border: 1px solid var(--bg1, #e3e5e7);
+  background: var(--bg2, #fff);
+  color: var(--text1, #18191c);
+  border-radius: 6px;
+  padding: 7px 16px;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.bc-mine__btn:hover { border-color: var(--text2, #9499a0); }
+
+.bc-mine__btn--danger {
+  border-color: transparent;
+  background: #f2555a;
+  color: #fff;
+}
+
+.bc-mine__btn--danger:hover { background: #e0454a; }
+
+.bc-mine__btn[disabled] { opacity: .6; cursor: default; }
+
+/* -------------------------------------------------------------- 轻提示 */
+
+.bc-mine__toast {
+  position: fixed;
+  left: 50%;
+  bottom: 32px;
+  transform: translateX(-50%);
+  z-index: 10000;
+  max-width: min(520px, calc(100vw - 48px));
+  padding: 10px 18px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, .82);
+  color: #fff;
+  font-size: 13px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, .3);
+}
+
+.bc-mine__toast--bad { background: #c0392b; }
+
+.bc-mine__nomsg { color: var(--text2, #9499a0); }
+
+/* ------------------------------------------------ 本页脚本过期了的提示条 */
+
+.bc-mine__stale {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 12px 0 0;
+  padding: 10px 14px;
+  border-radius: 6px;
+  background: rgba(226, 163, 61, .16);
+  color: var(--text1, #18191c);
+  font-size: 13px;
+}
+
+.bc-mine__reload {
+  flex: none;
+  border: 0;
+  border-radius: 4px;
+  padding: 5px 12px;
+  background: #e2a33d;
+  color: #1a1a1a;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.bc-mine__reload:hover { background: #d2942f; }
+
+.bc-mine__empty {
+  padding: 48px 0;
+  text-align: center;
+  color: var(--text2, #9499a0);
+}

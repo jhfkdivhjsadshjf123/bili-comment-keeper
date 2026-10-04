@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>评论管家</title>
+  <link rel="stylesheet" href="../src/ui.css">
+</head>
+<body class="popup">
+
+  <div class="pop-hd">
+    <span class="logo" aria-hidden="true"></span>
+    <h1>评论管家</h1>
+    <div class="spacer"></div>
+    <label class="switch" title="自动记录开关">
+      <input type="checkbox" id="enabled">
+      <span></span>
+    </label>
+  </div>
+
+  <div class="pop-body">
+    <div class="stats">
+      <div class="stat">
+        <b id="count">0</b>
+        <span>还在的评论</span>
+      </div>
+      <div class="stat">
+        <b id="arc-count">0</b>
+        <span>已删除</span>
+      </div>
+    </div>
+    <div class="pop-lines">
+      <div class="path-line" id="aicu-line"></div>
+      <div class="path-line" id="state-line"></div>
+    </div>
+  </div>
+
+  <div class="pop-ft">
+    <div class="pop-row">
+      <button id="btn-console" class="btn primary">打开控制台</button>
+      <button id="btn-settings" class="btn ghost">设置</button>
+    </div>
+  </div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
